@@ -304,12 +304,8 @@ MIT License - See [LICENSE](LICENSE) for details
 
 ## 🙏 Acknowledgments
 
-Built for the AI Retail Analytics Assignment using:
+Built for the AI Retail Analytics using:
 - [DSPy](https://github.com/stanfordnlp/dspy) - Stanford's framework for optimizing LLM programs
 - [LangGraph](https://github.com/langchain-ai/langgraph) - Stateful agent orchestration
 - [Ollama](https://ollama.com) - Local LLM runtime
 - [Northwind Database](https://github.com/jpwhite3/northwind-SQLite3) - Classic SQL sample dataset
-
----
-
-**Status**: ✅ Ready to run | Repository: [github.com/fadyanis037-max/Retail-analytics-copilot](https://github.com/fadyanis037-max/Retail-analytics-copilot)

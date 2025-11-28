@@ -1,440 +1,333 @@
-"""
-LangGraph hybrid agent for Retail Analytics.
-Orchestrates RAG + SQL with repair loop using DSPy modules.
-"""
-
-import os
-import json
-from typing import TypedDict, List, Dict, Any, Annotated
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
 import dspy
+from typing import TypedDict, List, Annotated, Dict, Any, Union, Literal
+from langgraph.graph import StateGraph, END
+import operator
+import json
 
-from agent.dspy_signatures import RouterModule, NL2SQLModule, SynthesizerModule
-from agent.rag.retrieval import DocumentRetriever
+from agent.dspy_signatures import RouterSignature, SQLGeneratorSignature, SynthesizerSignature, PlannerSignature
+from agent.rag.retrieval import LocalRetriever
 from agent.tools.sqlite_tool import SQLiteTool
 
-
-# =============================================================================
-# STATE SCHEMA
-# =============================================================================
-
+# --- State Definition ---
 class AgentState(TypedDict):
-    """State for the hybrid agent graph."""
     question: str
     format_hint: str
-    
-    # Routing
-    route: str  # rag, sql, or hybrid
-    
-    # Retrieval
-    retrieval_results: List[Dict]  # chunks with IDs, scores
-    retrieval_score: float
-    
-    # Planning
-    constraints: str  # Extracted constraints (dates, entities, formulas)
-    
-    # SQL
-    sql: str
-    sql_results: List[Dict]
-    sql_error: str
-    sql_success: bool
-    
-    # Repair
-    repair_count: int
-    
-    # Final output
+    messages: List[str] # Log of steps
+    strategy: str
+    retrieved_docs: List[Dict]
+    constraints: str
+    sql_query: str
+    sql_result: Dict[str, Any]
     final_answer: Any
-    confidence: float
-    explanation: str
     citations: List[str]
+    explanation: str
+    errors: List[str]
+    retry_count: int
 
+# --- Nodes ---
 
-# =============================================================================
-# AGENT
-# =============================================================================
-
-class HybridAgent:
-    """Hybrid RAG + SQL agent using LangGraph."""
-    
-    def __init__(
-        self,
-        docs_dir: str,
-        db_path: str,
-        model_name: str = "phi3.5:3.8b-mini-instruct-q4_K_M"
-    ):
-        """
-        Initialize agent.
+class RetailAgent:
+    def __init__(self):
+        self.retriever = LocalRetriever()
+        self.sqlite_tool = SQLiteTool()
         
-        Args:
-            docs_dir: Path to docs directory
-            db_path: Path to SQLite database
-            model_name: Ollama model name
-        """
-        self.docs_dir = docs_dir
-        self.db_path = db_path
+        # DSPy Modules
+        self.router = dspy.ChainOfThought(RouterSignature)
+        self.planner = dspy.ChainOfThought(PlannerSignature)
         
-        # Initialize DSPy with Ollama
-        self.lm = dspy.OllamaLocal(model=model_name, max_tokens=1000)
-        dspy.settings.configure(lm=self.lm)
-        
-        # Initialize tools
-        self.retriever = DocumentRetriever(docs_dir)
-        self.retriever.load_and_index()
-        
-        self.db_tool = SQLiteTool(db_path)
-        self.schema = self.db_tool.get_schema()
-        
-        # Initialize DSPy modules
-        self.router_module = RouterModule()
-        self.nl2sql_module = NL2SQLModule()
-        self.synthesizer_module = SynthesizerModule()
-        
-        # Build graph
-        self.graph = self._build_graph()
-    
-    def _build_graph(self) -> StateGraph:
-        """Build the LangGraph state machine."""
-        workflow = StateGraph(AgentState)
-        
-        # Add nodes
-        workflow.add_node("router", self.router_node)
-        workflow.add_node("retriever", self.retriever_node)
-        workflow.add_node("planner", self.planner_node)
-        workflow.add_node("nl2sql", self.nl2sql_node)
-        workflow.add_node("executor", self.executor_node)
-        workflow.add_node("repair", self.repair_node)
-        workflow.add_node("synthesizer", self.synthesizer_node)
-        
-        # Set entry point
-        workflow.set_entry_point("router")
-        
-        # Router edges
-        workflow.add_conditional_edges(
-            "router",
-            self.route_decision,
-            {
-                "rag_only": "retriever",
-                "sql_only": "planner",
-                "hybrid": "retriever"  # hybrid does both retriever and planner
-            }
-        )
-        
-        # Retriever edges
-        workflow.add_conditional_edges(
-            "retriever",
-            self.after_retriever,
-            {
-                "to_planner": "planner",  # for hybrid
-                "to_synthesizer": "synthesizer"  # for rag-only
-            }
-        )
-        
-        # Planner -> NL2SQL
-        workflow.add_edge("planner", "nl2sql")
-        
-        # NL2SQL -> Executor
-        workflow.add_edge("nl2sql", "executor")
-        
-        # Executor edges (success or repair)
-        workflow.add_conditional_edges(
-            "executor",
-            self.after_executor,
-            {
-                "to_synthesizer": "synthesizer",
-                "to_repair": "repair"
-            }
-        )
-        
-        # Repair edges (retry or give up)
-        workflow.add_conditional_edges(
-            "repair",
-            self.after_repair,
-            {
-                "retry": "nl2sql",
-                "give_up": "synthesizer"
-            }
-        )
-        
-        # Synthesizer -> END
-        workflow.add_edge("synthesizer", END)
-        
-        return workflow.compile(checkpointer=MemorySaver())
-    
-    # =========================================================================
-    # NODES
-    # =========================================================================
-    
-    def router_node(self, state: AgentState) -> AgentState:
-        """Route the question to rag, sql, or hybrid."""
-        result = self.router_module(question=state["question"])
-        state["route"] = result.route
-        state["repair_count"] = 0
-        return state
-    
-    def retriever_node(self, state: AgentState) -> AgentState:
-        """Retrieve relevant document chunks."""
-        chunks = self.retriever.search(state["question"], top_k=3)
-        
-        state["retrieval_results"] = [
-            {
-                "id": chunk.id,
-                "content": chunk.content,
-                "source": chunk.source,
-                "score": chunk.score
-            }
-            for chunk in chunks
-        ]
-        
-        # Calculate avg retrieval score
-        if chunks:
-            state["retrieval_score"] = sum(c.score for c in chunks) / len(chunks)
-        else:
-            state["retrieval_score"] = 0.0
-        
-        return state
-    
-    def planner_node(self, state: AgentState) -> AgentState:
-        """Extract constraints from retrieval results and question."""
-        constraints_parts = []
-        
-        # Extract date ranges from marketing calendar
-        for result in state.get("retrieval_results", []):
-            if "marketing_calendar" in result["id"]:
-                constraints_parts.append(f"Marketing calendar context: {result['content']}")
-        
-        # Extract KPI formulas
-        for result in state.get("retrieval_results", []):
-            if "kpi_definitions" in result["id"]:
-                constraints_parts.append(f"KPI definition: {result['content']}")
-        
-        # Add question context
-        constraints_parts.append(f"Question context: {state['question']}")
-        
-        state["constraints"] = "\n".join(constraints_parts) if constraints_parts else "No specific constraints"
-        
-        return state
-    
-    def nl2sql_node(self, state: AgentState) -> AgentState:
-        """Generate SQL query using DSPy."""
-        error_feedback = state.get("sql_error", "")
-        
-        result = self.nl2sql_module(
-            question=state["question"],
-            schema=self.schema,
-            constraints=state.get("constraints", ""),
-            error_feedback=error_feedback
-        )
-        
-        state["sql"] = result.sql
-        return state
-    
-    def executor_node(self, state: AgentState) -> AgentState:
-        """Execute SQL query."""
-        success, results, error = self.db_tool.execute_query(state["sql"])
-        
-        state["sql_success"] = success
-        if success:
-            state["sql_results"] = results
-            state["sql_error"] = ""
-        else:
-            state["sql_results"] = []
-            state["sql_error"] = error
-        
-        return state
-    
-    def repair_node(self, state: AgentState) -> AgentState:
-        """Increment repair counter."""
-        state["repair_count"] = state.get("repair_count", 0) + 1
-        return state
-    
-    def synthesizer_node(self, state: AgentState) -> AgentState:
-        """Synthesize final answer with citations."""
-        # Format retrieval results
-        retrieval_text = ""
-        if state.get("retrieval_results"):
-            retrieval_text = json.dumps([
-                {"id": r["id"], "content": r["content"], "score": r["score"]}
-                for r in state["retrieval_results"]
-            ], indent=2)
-        
-        # Format SQL results
-        sql_text = ""
-        if state.get("sql_results"):
-            sql_text = json.dumps(state["sql_results"], indent=2)
-        
-        result = self.synthesizer_module(
-            question=state["question"],
-            format_hint=state["format_hint"],
-            retrieval_results=retrieval_text,
-            sql_results=sql_text
-        )
-        
-        # Parse final answer based on format_hint
-        final_answer = self._parse_answer(result.final_answer, state["format_hint"])
-        
-        # Parse confidence
+        # Load optimized SQL Generator if exists
+        self.sql_generator = dspy.ChainOfThought(SQLGeneratorSignature)
         try:
-            confidence = float(result.confidence)
+            self.sql_generator.load("agent/optimized_sql_gen.json")
+            print("Loaded optimized SQL Generator.")
         except:
-            confidence = 0.5
+            pass
+            
+        self.synthesizer = dspy.ChainOfThought(SynthesizerSignature)
+
+    def route_query(self, state: AgentState) -> AgentState:
+        """Determines the strategy."""
+        pred = self.router(question=state["question"])
+        # Normalize strategy
+        strategy = pred.strategy.lower().strip()
+        if "sql" in strategy and "rag" in strategy:
+            strategy = "hybrid"
+        elif "sql" in strategy:
+            strategy = "sql"
+        elif "rag" in strategy:
+            strategy = "rag"
+        else:
+            strategy = "hybrid" # Default
+            
+        state["strategy"] = strategy
+        state["messages"].append(f"Router selected: {strategy}")
+        return state
+
+    def retrieve_docs(self, state: AgentState) -> AgentState:
+        """Retrieves documents."""
+        docs = self.retriever.retrieve(state["question"], k=3)
+        state["retrieved_docs"] = docs
+        state["messages"].append(f"Retrieved {len(docs)} chunks")
+        return state
+
+    def plan_query(self, state: AgentState) -> AgentState:
+        """Extracts constraints."""
+        context = "\n".join([f"{d['id']}: {d['content']}" for d in state["retrieved_docs"]])
+        pred = self.planner(question=state["question"], context=context)
+        state["constraints"] = pred.constraints
+        state["messages"].append(f"Planned constraints: {pred.constraints}")
+        return state
+
+    def generate_sql(self, state: AgentState) -> AgentState:
+        """Generates SQL."""
+        schema = self.sqlite_tool.get_schema()
+        constraints = state.get("constraints", "")
         
-        # Calculate confidence heuristic
-        confidence = self._calculate_confidence(state, confidence)
+        # If retrying, include error context
+        question_context = state["question"]
+        if state["retry_count"] > 0 and state["errors"]:
+            question_context += f"\nPrevious Error: {state['errors'][-1]}"
+            
+        pred = self.sql_generator(question=question_context, schema=schema, constraints=constraints)
         
-        # Parse citations
-        citations = [c.strip() for c in result.citations.split(",") if c.strip()]
+        # Clean SQL (remove markdown code blocks if present)
+        sql = pred.sql_query.replace("```sql", "").replace("```", "").strip()
+        state["sql_query"] = sql
+        state["messages"].append(f"Generated SQL: {sql}")
+        return state
+
+    def execute_sql(self, state: AgentState) -> AgentState:
+        """Executes SQL."""
+        result = self.sqlite_tool.execute_sql(state["sql_query"])
+        state["sql_result"] = result
+        if result["error"]:
+            state["errors"].append(result["error"])
+            state["messages"].append(f"SQL Execution Error: {result['error']}")
+        else:
+            state["messages"].append(f"SQL Executed. Rows: {len(result['rows'])}")
+        return state
+
+    def synthesize_answer(self, state: AgentState) -> AgentState:
+        """Synthesizes the final answer with robust parsing."""
+        import re
+        import ast
+        
+        context = "\n".join([f"{d['id']}: {d['content']}" for d in state["retrieved_docs"]])
+        sql_res_str = str(state.get("sql_result", {}))
+        
+        # Truncate SQL result if too long for context window
+        if len(sql_res_str) > 2000:
+             sql_res_str = sql_res_str[:2000] + "... (truncated)"
+
+        # Try DSPy synthesis with error handling
+        try:
+            pred = self.synthesizer(
+                question=state["question"],
+                context=context,
+                sql_result=sql_res_str,
+                format_hint=state["format_hint"]
+            )
+            
+            final_answer = pred.final_answer
+            explanation = pred.explanation
+            raw_citations = pred.citations
+            
+        except Exception as e:
+            # Fallback: Manual LLM call and parsing
+            state["messages"].append(f"DSPy synthesis failed, using fallback: {str(e)[:100]}")
+            
+            # Direct LLM call
+            lm = dspy.settings.lm
+            prompt = f"""Answer this question precisely in the requested format.
+
+Question: {state["question"]}
+Format required: {state["format_hint"]}
+
+Context from documents:
+{context[:500]}
+
+SQL Result:
+{sql_res_str[:500]}
+
+Provide your answer in this exact format:
+ANSWER: <your answer matching the format exactly>
+EXPLANATION: <1-2 sentence explanation>
+CITATIONS: <comma-separated list of tables/docs used>"""
+
+            response = lm(prompt)
+            response_text = str(response)
+            
+            # Parse response
+            answer_match = re.search(r'ANSWER:\s*(.+?)(?=EXPLANATION:|$)', response_text, re.DOTALL)
+            expl_match = re.search(r'EXPLANATION:\s*(.+?)(?=CITATIONS:|$)', response_text, re.DOTALL)
+            cite_match = re.search(r'CITATIONS:\s*(.+?)$', response_text, re.DOTALL)
+            
+            final_answer = answer_match.group(1).strip() if answer_match else "Unable to determine"
+            explanation = expl_match.group(1).strip() if expl_match else "Processed from available data."
+            raw_citations = cite_match.group(1).strip() if cite_match else ""
+        
+        # Parse and type-cast final answer based on format_hint
+        format_hint = state["format_hint"].lower()
+        
+        try:
+            if format_hint == "int":
+                # Extract integer
+                match = re.search(r'\d+', str(final_answer))
+                final_answer = int(match.group()) if match else 0
+                
+            elif format_hint == "float":
+                # Extract float
+                match = re.search(r'[\d.]+', str(final_answer))
+                final_answer = float(match.group()) if match else 0.0
+                
+            elif "{" in format_hint or "dict" in format_hint:
+                # Try to parse as dict
+                if isinstance(final_answer, str):
+                    try:
+                        final_answer = ast.literal_eval(final_answer)
+                    except:
+                        # Try JSON
+                        import json
+                        try:
+                            final_answer = json.loads(final_answer)
+                        except:
+                            # Extract key-value pairs manually
+                            final_answer = {}
+                            
+            elif "list" in format_hint:
+                # Try to parse as list
+                if isinstance(final_answer, str):
+                    try:
+                        final_answer = ast.literal_eval(final_answer)
+                    except:
+                        import json
+                        try:
+                            final_answer = json.loads(final_answer)
+                        except:
+                            final_answer = []
+        except Exception as parse_err:
+            state["messages"].append(f"Type conversion warning: {str(parse_err)[:100]}")
         
         state["final_answer"] = final_answer
-        state["confidence"] = confidence
-        state["explanation"] = result.explanation
-        state["citations"] = citations
+        state["explanation"] = explanation[:200]  # Limit explanation length
         
+        # Clean citations
+        if isinstance(raw_citations, str):
+            # Try to parse string list
+            try:
+                raw_citations = ast.literal_eval(raw_citations)
+            except:
+                # Split by common delimiters
+                raw_citations = [c.strip() for c in re.split(r'[,;\n]', raw_citations) if c.strip()]
+        
+        # Add SQL tables to citations if SQL was used
+        if state.get("sql_query") and not state.get("sql_result", {}).get("error"):
+            # Extract table names from SQL
+            sql = state["sql_query"].lower()
+            common_tables = ["orders", "order_items", "products", "customers", "categories", "suppliers"]
+            for table in common_tables:
+                if table in sql and table not in [str(c).lower() for c in raw_citations]:
+                    raw_citations.append(table)
+        
+        # Add doc chunk IDs to citations
+        for doc in state["retrieved_docs"]:
+            doc_id = doc.get("id", doc.get("full_id", ""))
+            if doc_id and doc_id not in raw_citations:
+                raw_citations.append(doc_id)
+        
+        state["citations"] = list(set(raw_citations))  # Remove duplicates
+        state["messages"].append("Synthesized answer with fallback parsing")
         return state
+
+    def repair_node(self, state: AgentState) -> AgentState:
+        """Increments retry count and prepares for repair."""
+        state["retry_count"] += 1
+        state["messages"].append(f"Triggering repair. Retry count: {state['retry_count']}")
+        return state
+
+    def check_repair(self, state: AgentState) -> Literal["repair", "end"]:
+        """Decides whether to repair or end."""
+        # Check 1: SQL Error
+        if state.get("sql_result") and state["sql_result"].get("error"):
+            if state["retry_count"] < 2:
+                return "repair"
+        
+        return "end"
+
+# --- Graph Construction ---
+
+def build_graph():
+    agent = RetailAgent()
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("router", agent.route_query)
+    workflow.add_node("retriever", agent.retrieve_docs)
+    workflow.add_node("planner", agent.plan_query)
+    workflow.add_node("sql_generator", agent.generate_sql)
+    workflow.add_node("executor", agent.execute_sql)
+    workflow.add_node("repair_node", agent.repair_node)
+    workflow.add_node("synthesizer_node", agent.synthesize_answer)
+
+    # Edges
+    workflow.set_entry_point("router")
     
-    # =========================================================================
-    # ROUTING LOGIC
-    # =========================================================================
-    
-    def route_decision(self, state: AgentState) -> str:
-        """Determine routing after router node."""
-        route = state["route"]
-        if route == "rag":
-            return "rag_only"
-        elif route == "sql":
+    # Router logic
+    def route_decision(state):
+        if state["strategy"] == "rag":
+            return "retriever_only"
+        elif state["strategy"] == "sql":
             return "sql_only"
         else:
             return "hybrid"
-    
-    def after_retriever(self, state: AgentState) -> str:
-        """Determine routing after retriever."""
-        if state["route"] == "hybrid":
-            return "to_planner"
-        else:
-            return "to_synthesizer"
-    
-    def after_executor(self, state: AgentState) -> str:
-        """Determine routing after executor."""
-        if state["sql_success"]:
-            return "to_synthesizer"
-        else:
-            # Try repair if under limit
-            if state.get("repair_count", 0) < 2:
-                return "to_repair"
-            else:
-                return "to_synthesizer"
-    
-    def after_repair(self, state: AgentState) -> str:
-        """Determine routing after repair."""
-        if state["repair_count"] < 2:
-            return "retry"
-        else:
-            return "give_up"
-    
-    # =========================================================================
-    # UTILITIES
-    # =========================================================================
-    
-    def _parse_answer(self, answer_str: str, format_hint: str) -> Any:
-        """Parse answer string according to format_hint."""
-        answer_str = answer_str.strip()
-        
-        # Try to extract JSON if present
-        if "{" in answer_str or "[" in answer_str:
-            try:
-                # Find JSON-like content
-                start = min(
-                    answer_str.find("{") if "{" in answer_str else len(answer_str),
-                    answer_str.find("[") if "[" in answer_str else len(answer_str)
-                )
-                end = max(
-                    answer_str.rfind("}") if "}" in answer_str else -1,
-                    answer_str.rfind("]") if "]" in answer_str else -1
-                ) + 1
-                
-                if start < end:
-                    json_str = answer_str[start:end]
-                    return json.loads(json_str)
-            except:
-                pass
-        
-        # Try int
-        if format_hint == "int":
-            try:
-                # Extract first number
-                import re
-                match = re.search(r'-?\d+', answer_str)
-                if match:
-                    return int(match.group())
-            except:
-                pass
-        
-        # Try float
-        if format_hint == "float":
-            try:
-                import re
-                match = re.search(r'-?\d+\.?\d*', answer_str)
-                if match:
-                    return round(float(match.group()), 2)
-            except:
-                pass
-        
-        # Default: return as-is
-        return answer_str
-    
-    def _calculate_confidence(self, state: AgentState, base_confidence: float) -> float:
-        """Calculate confidence score using heuristics."""
-        confidence = 0.5  # Start with base
-        
-        # Add for good retrieval
-        if state.get("retrieval_score", 0) > 0.5:
-            confidence += 0.2
-        
-        # Add for successful SQL
-        if state.get("sql_success"):
-            confidence += 0.2
-            if state.get("sql_results"):
-                confidence += 0.1
-        
-        # Penalize for repairs
-        confidence -= state.get("repair_count", 0) * 0.15
-        
-        # Clamp to [0, 1]
-        return max(0.0, min(1.0, confidence))
-    
-    def run(self, question: str, format_hint: str, question_id: str = "test") -> Dict:
-        """
-        Run the agent on a single question.
-        
-        Args:
-            question: User's question
-            format_hint: Expected output format
-            question_id: Question ID for checkpointing
-            
-        Returns:
-            Final state dict
-        """
-        initial_state = {
-            "question": question,
-            "format_hint": format_hint,
-            "route": "",
-            "retrieval_results": [],
-            "retrieval_score": 0.0,
-            "constraints": "",
-            "sql": "",
-            "sql_results": [],
-            "sql_error": "",
-            "sql_success": False,
-            "repair_count": 0,
-            "final_answer": None,
-            "confidence": 0.0,
-            "explanation": "",
-            "citations": []
+
+    workflow.add_conditional_edges(
+        "router",
+        route_decision,
+        {
+            "retriever_only": "retriever",
+            "sql_only": "sql_generator",
+            "hybrid": "retriever"
         }
-        
-        config = {"configurable": {"thread_id": question_id}}
-        
-        # Run the graph
-        final_state = self.graph.invoke(initial_state, config)
-        
-        return final_state
+    )
+
+    # Hybrid/RAG path
+    workflow.add_edge("retriever", "planner")
+    
+    def plan_decision(state):
+        if state["strategy"] == "rag":
+            return "synthesizer_node"
+        else:
+            return "sql_generator"
+
+    workflow.add_conditional_edges(
+        "planner",
+        plan_decision,
+        {
+            "synthesizer_node": "synthesizer_node",
+            "sql_generator": "sql_generator"
+        }
+    )
+
+    # SQL path
+    workflow.add_edge("sql_generator", "executor")
+    
+    def execution_decision(state):
+        if state["sql_result"].get("error") and state["retry_count"] < 2:
+            return "repair_sql"
+        return "synthesizer_node"
+
+    workflow.add_conditional_edges(
+        "executor",
+        execution_decision,
+        {
+            "repair_sql": "repair_node", 
+            "synthesizer_node": "synthesizer_node"
+        }
+    )
+    
+    workflow.add_edge("repair_node", "sql_generator")
+
+    # Synthesizer to End
+    workflow.add_edge("synthesizer_node", END)
+
+    return workflow.compile()

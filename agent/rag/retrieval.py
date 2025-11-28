@@ -1,110 +1,70 @@
-"""
-BM25-based document retrieval system for RAG.
-Handles chunking, indexing, and search with citation tracking.
-"""
-
 import os
-from typing import List, Dict, Tuple
-from dataclasses import dataclass
-import re
-from rank_bm25 import BM25Okapi
+import glob
+from typing import List, Dict
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
-
-@dataclass
-class Chunk:
-    """Represents a document chunk with metadata."""
-    id: str  # Format: "{filename}::chunk{N}"
-    content: str
-    source: str  # Filename
-    score: float = 0.0
-
-
-class DocumentRetriever:
-    """BM25-based retriever for local documents."""
-    
-    def __init__(self, docs_dir: str):
-        """
-        Initialize retriever with document directory.
-        
-        Args:
-            docs_dir: Path to directory containing markdown files
-        """
+class LocalRetriever:
+    def __init__(self, docs_dir: str = "docs"):
         self.docs_dir = docs_dir
-        self.chunks: List[Chunk] = []
-        self.bm25 = None
-        self.tokenized_chunks = []
+        self.chunks: List[Dict] = []
+        self.vectorizer = None
+        self.tfidf_matrix = None
+        self._load_and_index()
+
+    def _load_and_index(self):
+        """Loads markdown files, chunks them, and builds TF-IDF index."""
+        file_paths = glob.glob(os.path.join(self.docs_dir, "*.md"))
         
-    def load_and_index(self):
-        """Load all documents, chunk them, and build BM25 index."""
-        # Load all markdown files
-        for filename in os.listdir(self.docs_dir):
-            if filename.endswith('.md'):
-                filepath = os.path.join(self.docs_dir, filename)
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                # Chunk by paragraphs (split on double newlines)
-                paragraphs = re.split(r'\n\n+', content.strip())
-                
-                for idx, para in enumerate(paragraphs):
-                    if para.strip():  # Skip empty paragraphs
-                        chunk_id = f"{filename.replace('.md', '')}::chunk{idx}"
-                        chunk = Chunk(
-                            id=chunk_id,
-                            content=para.strip(),
-                            source=filename
-                        )
-                        self.chunks.append(chunk)
-        
-        # Tokenize chunks for BM25 (simple whitespace tokenization)
-        self.tokenized_chunks = [
-            chunk.content.lower().split() 
-            for chunk in self.chunks
-        ]
-        
-        # Build BM25 index
-        if self.tokenized_chunks:
-            self.bm25 = BM25Okapi(self.tokenized_chunks)
-    
-    def search(self, query: str, top_k: int = 3) -> List[Chunk]:
-        """
-        Search for relevant chunks using BM25.
-        
-        Args:
-            query: Search query
-            top_k: Number of top results to return
+        chunk_id_counter = 0
+        for file_path in file_paths:
+            filename = os.path.basename(file_path)
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
             
-        Returns:
-            List of Chunk objects with scores
-        """
-        if not self.bm25 or not self.chunks:
+            # Simple paragraph splitting
+            # Split by double newline to get paragraphs/sections
+            raw_chunks = content.split("\n\n")
+            
+            for i, raw_chunk in enumerate(raw_chunks):
+                clean_chunk = raw_chunk.strip()
+                if not clean_chunk:
+                    continue
+                
+                # Further split if lines start with # (headers) to keep context?
+                # For simplicity, we just treat paragraphs/sections as chunks.
+                # We might want to prepend the filename or header to the chunk for context.
+                
+                self.chunks.append({
+                    "id": f"{filename}::chunk{i}",
+                    "content": clean_chunk,
+                    "source": filename,
+                    "full_id": f"{filename}::chunk{i}"
+                })
+                chunk_id_counter += 1
+        
+        if self.chunks:
+            corpus = [chunk["content"] for chunk in self.chunks]
+            self.vectorizer = TfidfVectorizer(stop_words='english')
+            self.tfidf_matrix = self.vectorizer.fit_transform(corpus)
+
+    def retrieve(self, query: str, k: int = 3) -> List[Dict]:
+        """Retrieves top-k relevant chunks for the query."""
+        if not self.chunks or self.vectorizer is None:
             return []
         
-        # Tokenize query
-        tokenized_query = query.lower().split()
+        query_vec = self.vectorizer.transform([query])
+        similarities = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
         
-        # Get BM25 scores
-        scores = self.bm25.get_scores(tokenized_query)
+        # Get top k indices
+        top_k_indices = similarities.argsort()[-k:][::-1]
         
-        # Get top-k indices
-        top_indices = sorted(
-            range(len(scores)), 
-            key=lambda i: scores[i], 
-            reverse=True
-        )[:top_k]
-        
-        # Build result chunks with scores
         results = []
-        for idx in top_indices:
-            chunk = self.chunks[idx]
-            chunk.score = float(scores[idx])
-            results.append(chunk)
-        
+        for idx in top_k_indices:
+            if similarities[idx] > 0: # Only return positive matches
+                chunk = self.chunks[idx].copy()
+                chunk["score"] = float(similarities[idx])
+                results.append(chunk)
+                
         return results
-    
-    def get_chunk_by_id(self, chunk_id: str) -> Chunk:
-        """Get a specific chunk by its ID."""
-        for chunk in self.chunks:
-            if chunk.id == chunk_id:
-                return chunk
-        return None
